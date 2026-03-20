@@ -23,30 +23,167 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	formatconfig "github.com/go-git/go-git/v5/plumbing/format/config"
 )
+
+type gitConfigPath struct {
+	section    string
+	subsection string
+	key        string
+}
+
+func parseGitConfigPath(key string) (gitConfigPath, error) {
+	parts := strings.SplitN(key, ".", 3)
+	switch len(parts) {
+	case 2:
+		return gitConfigPath{section: parts[0], key: parts[1]}, nil
+	case 3:
+		return gitConfigPath{section: parts[0], subsection: parts[1], key: parts[2]}, nil
+	default:
+		return gitConfigPath{}, fmt.Errorf("invalid git config key %q", key)
+	}
+}
+
+func lookupRawConfigOption(cfg *formatconfig.Config, path gitConfigPath) (string, bool) {
+	if cfg == nil {
+		return "", false
+	}
+
+	for _, section := range cfg.Sections {
+		if !section.IsName(path.section) {
+			continue
+		}
+
+		if path.subsection == "" {
+			if !section.HasOption(path.key) {
+				return "", false
+			}
+			return section.Option(path.key), true
+		}
+
+		for _, subsection := range section.Subsections {
+			if !subsection.IsName(path.subsection) {
+				continue
+			}
+			if !subsection.HasOption(path.key) {
+				return "", false
+			}
+			return subsection.Option(path.key), true
+		}
+
+		return "", false
+	}
+
+	return "", false
+}
+
+func updateRawConfigOption(cfg *formatconfig.Config, path gitConfigPath, value string) bool {
+	current, ok := lookupRawConfigOption(cfg, path)
+	if value == "" {
+		if !ok {
+			return false
+		}
+
+		if path.subsection == "" {
+			cfg.Section(path.section).RemoveOption(path.key)
+		} else {
+			cfg.Section(path.section).Subsection(path.subsection).RemoveOption(path.key)
+		}
+
+		return true
+	}
+
+	if ok && current == value {
+		return false
+	}
+
+	if path.subsection == "" {
+		cfg.Section(path.section).SetOption(path.key, value)
+	} else {
+		cfg.Section(path.section).Subsection(path.subsection).SetOption(path.key, value)
+	}
+
+	return true
+}
+
+func updateRemoteURL(cfg *config.Config, path gitConfigPath, value string) (bool, error) {
+	if value == "" {
+		return false, fmt.Errorf("remote URL for %q cannot be empty", path.subsection)
+	}
+
+	remote := cfg.Remotes[path.subsection]
+	if remote == nil {
+		remote = &config.RemoteConfig{Name: path.subsection}
+		cfg.Remotes[path.subsection] = remote
+	}
+
+	current := ""
+	if len(remote.URLs) > 0 {
+		current = remote.URLs[0]
+	}
+	if current == value && len(remote.URLs) == 1 {
+		return false, nil
+	}
+
+	remote.URLs = []string{value}
+	return true, nil
+}
+
+func updateGitConfigOption(cfg *config.Config, key, value string) (bool, error) {
+	path, err := parseGitConfigPath(key)
+	if err != nil {
+		return false, err
+	}
+
+	if path.section == "remote" && path.subsection != "" && path.key == "url" {
+		return updateRemoteURL(cfg, path, value)
+	}
+
+	return updateRawConfigOption(cfg.Raw, path, value), nil
+}
 
 // Updates the zoekt.* git config options after a repo is cloned.
 // Once a repo is cloned, we can no longer use the --config flag to update all
 // of it's zoekt.* settings at once. `git config` is limited to one option at once.
-func updateZoektGitConfig(repoDest string, settings map[string]string) error {
+func updateZoektGitConfig(repoDest string, settings map[string]string) (bool, error) {
+	repo, err := git.PlainOpen(repoDest)
+	if err != nil {
+		return false, err
+	}
+
+	cfg, err := repo.Config()
+	if err != nil {
+		return false, err
+	}
+
 	var keys []string
 	for k := range settings {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
+	var changed bool
 	for _, k := range keys {
-		if settings[k] != "" {
-			if err := exec.Command("git", "-C", repoDest, "config", k, settings[k]).Run(); err != nil {
-				return err
-			}
+		updated, err := updateGitConfigOption(cfg, k, settings[k])
+		if err != nil {
+			return false, err
 		}
+		changed = changed || updated
 	}
 
-	return nil
+	if !changed {
+		return false, nil
+	}
+
+	if err := repo.Storer.SetConfig(cfg); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // CloneRepo clones one repository, adding the given config
@@ -64,8 +201,12 @@ func CloneRepo(destDir, name, cloneURL string, settings map[string]string) (stri
 		// Repository exists, ensure settings are in sync including the clone URL
 		settings := maps.Clone(settings)
 		settings["remote.origin.url"] = cloneURL
-		if err := updateZoektGitConfig(repoDest, settings); err != nil {
+		hadUpdate, err := updateZoektGitConfig(repoDest, settings)
+		if err != nil {
 			return "", fmt.Errorf("failed to update repository settings: %w", err)
+		}
+		if hadUpdate {
+			return repoDest, nil
 		}
 		return "", nil
 	}
